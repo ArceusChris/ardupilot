@@ -37,8 +37,9 @@ AP_ExternalAHRS_DMIMU::AP_ExternalAHRS_DMIMU(AP_ExternalAHRS *_frontend, AP_Exte
 
     set_default_sensors(uint16_t(AP_ExternalAHRS::AvailableSensor::IMU));
 
-    if (!hal.scheduler->thread_create(FUNCTOR_BIND_MEMBER(&AP_ExternalAHRS_DMIMU::update_thread, void),
-                                      "AHRS_DMIMU", 2048, AP_HAL::Scheduler::PRIORITY_SPI, 0)) {
+    thread_started = hal.scheduler->thread_create(FUNCTOR_BIND_MEMBER(&AP_ExternalAHRS_DMIMU::update_thread, void),
+                                                  "AHRS_DMIMU", 2048, AP_HAL::Scheduler::PRIORITY_SPI, 0);
+    if (!thread_started) {
         GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "DM-IMU: failed to create thread");
     }
 }
@@ -55,13 +56,13 @@ const char* AP_ExternalAHRS_DMIMU::get_name() const
 
 bool AP_ExternalAHRS_DMIMU::healthy(void) const
 {
-    const uint32_t now_ms = AP_HAL::millis();
+    const uint64_t now_us = AP_HAL::micros64();
 
     WITH_SEMAPHORE(driver_state.semaphore);
     return driver_state.have_accel &&
            driver_state.have_gyro &&
-           now_ms - driver_state.last_accel_ms <= 200 &&
-           now_ms - driver_state.last_gyro_ms <= 200;
+           now_us - driver_state.last_accel_us <= 200000U &&
+           now_us - driver_state.last_gyro_us <= 200000U;
 }
 
 bool AP_ExternalAHRS_DMIMU::initialised(void) const
@@ -80,13 +81,18 @@ bool AP_ExternalAHRS_DMIMU::pre_arm_check(char *failure_msg, uint8_t failure_msg
 
 void AP_ExternalAHRS_DMIMU::update()
 {
-    check_uart();
+    if (!thread_started) {
+        check_uart();
+    }
+    publish_due();
 }
 
 void AP_ExternalAHRS_DMIMU::update_thread()
 {
     while (true) {
-        if (!check_uart()) {
+        const bool got_data = check_uart();
+        publish_due();
+        if (!got_data) {
             hal.scheduler->delay_microseconds(500);
         }
     }
@@ -102,7 +108,10 @@ bool AP_ExternalAHRS_DMIMU::check_uart()
         uart->begin(baudrate);
         configure_device();
         setup_complete = true;
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "DM-IMU: init baud:%u rate:%uHz", unsigned(baudrate), unsigned(1000U / output_interval_ms()));
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "DM-IMU: init baud:%u imu:%uHz ekf:%uHz",
+                      unsigned(baudrate),
+                      unsigned(DEVICE_OUTPUT_RATE_HZ),
+                      unsigned(EKF_OUTPUT_RATE_HZ));
     }
 
     const auto nread = uart->read(read_buffer, sizeof(read_buffer));
@@ -110,9 +119,9 @@ bool AP_ExternalAHRS_DMIMU::check_uart()
         return false;
     }
 
-    const uint32_t now_ms = AP_HAL::millis();
+    const uint64_t now_us = AP_HAL::micros64();
     for (ssize_t i = 0; i < nread; i++) {
-        parse_byte(read_buffer[i], now_ms);
+        parse_byte(read_buffer[i], now_us);
     }
 
     return true;
@@ -157,25 +166,10 @@ void AP_ExternalAHRS_DMIMU::send_command(const uint8_t *command, uint8_t len)
 
 uint16_t AP_ExternalAHRS_DMIMU::output_interval_ms() const
 {
-    uint16_t rate_hz = get_rate();
-
-    if (rate_hz < MIN_OUTPUT_RATE_HZ) {
-        rate_hz = MIN_OUTPUT_RATE_HZ;
-    } else if (rate_hz > MAX_OUTPUT_RATE_HZ) {
-        rate_hz = MAX_OUTPUT_RATE_HZ;
-    }
-
-    uint16_t interval_ms = (1000U + rate_hz / 2U) / rate_hz;
-    if (interval_ms < 1) {
-        interval_ms = 1;
-    } else if (interval_ms > 10) {
-        interval_ms = 10;
-    }
-
-    return interval_ms;
+    return 1000U / DEVICE_OUTPUT_RATE_HZ;
 }
 
-void AP_ExternalAHRS_DMIMU::parse_byte(uint8_t b, uint32_t now_ms)
+void AP_ExternalAHRS_DMIMU::parse_byte(uint8_t b, uint64_t now_us)
 {
     if (frame_ofs == 0 && b != FRAME_HEADER1) {
         return;
@@ -197,7 +191,7 @@ void AP_ExternalAHRS_DMIMU::parse_byte(uint8_t b, uint32_t now_ms)
     Vector3f value;
     uint8_t rid;
     if (parse_frame(value, rid)) {
-        handle_frame(rid, value, now_ms);
+        handle_frame(rid, value, now_us);
     }
 }
 
@@ -228,47 +222,107 @@ bool AP_ExternalAHRS_DMIMU::parse_frame(Vector3f &value, uint8_t &rid) const
     return isfinite(value.x) && isfinite(value.y) && isfinite(value.z);
 }
 
-void AP_ExternalAHRS_DMIMU::handle_frame(uint8_t rid, const Vector3f &value, uint32_t now_ms)
+void AP_ExternalAHRS_DMIMU::handle_frame(uint8_t rid, const Vector3f &value, uint64_t now_us)
 {
     if (!valid_sensor_sample(rid, value)) {
         return;
     }
 
-    bool publish_sample = false;
-    AP_ExternalAHRS::ins_data_message_t ins {};
+    WITH_SEMAPHORE(driver_state.semaphore);
+
+    if (rid == RID_ACCEL) {
+        driver_state.pending_accel = value;
+        driver_state.pending_have_accel = true;
+        driver_state.have_accel = true;
+        driver_state.last_accel_us = now_us;
+    } else if (rid == RID_GYRO) {
+        driver_state.pending_gyro = value;
+        driver_state.pending_have_gyro = true;
+        driver_state.have_gyro = true;
+        driver_state.last_gyro_us = now_us;
+    }
+
+    if (driver_state.pending_have_accel && driver_state.pending_have_gyro) {
+        uint64_t sample_time_us = driver_state.last_accel_us;
+        if (driver_state.last_gyro_us > sample_time_us) {
+            sample_time_us = driver_state.last_gyro_us;
+        }
+        push_sample_locked(driver_state.pending_accel, driver_state.pending_gyro, sample_time_us);
+        driver_state.pending_have_accel = false;
+        driver_state.pending_have_gyro = false;
+    }
+}
+
+void AP_ExternalAHRS_DMIMU::push_sample_locked(const Vector3f &accel, const Vector3f &gyro, uint64_t time_us)
+{
+    driver_state.samples[driver_state.sample_head] = {accel, gyro, time_us};
+    driver_state.sample_head = (driver_state.sample_head + 1) % SAMPLE_BUFFER_SIZE;
+    if (driver_state.sample_count < SAMPLE_BUFFER_SIZE) {
+        driver_state.sample_count++;
+    }
+}
+
+bool AP_ExternalAHRS_DMIMU::pop_closest_sample(uint64_t target_us, sample_t &sample)
+{
+    WITH_SEMAPHORE(driver_state.semaphore);
+
+    if (driver_state.sample_count == 0) {
+        return false;
+    }
+
+    const uint8_t oldest = (driver_state.sample_head + SAMPLE_BUFFER_SIZE - driver_state.sample_count) % SAMPLE_BUFFER_SIZE;
+    uint8_t best_offset = 0;
+    uint64_t best_delta = UINT64_MAX;
+
+    for (uint8_t i = 0; i < driver_state.sample_count; i++) {
+        const uint8_t idx = (oldest + i) % SAMPLE_BUFFER_SIZE;
+        const uint64_t sample_time_us = driver_state.samples[idx].time_us;
+        const uint64_t delta = (sample_time_us > target_us) ? sample_time_us - target_us : target_us - sample_time_us;
+        if (delta < best_delta) {
+            best_delta = delta;
+            best_offset = i;
+        }
+    }
+
+    const uint8_t best_idx = (oldest + best_offset) % SAMPLE_BUFFER_SIZE;
+    sample = driver_state.samples[best_idx];
+    driver_state.sample_count -= best_offset + 1;
+    return true;
+}
+
+void AP_ExternalAHRS_DMIMU::publish_due()
+{
+    const uint64_t now_us = AP_HAL::micros64();
+    uint64_t target_us;
 
     {
         WITH_SEMAPHORE(driver_state.semaphore);
-
-        if (rid == RID_ACCEL) {
-            driver_state.accel = value;
-            driver_state.have_accel = true;
-            driver_state.last_accel_ms = now_ms;
-        } else if (rid == RID_GYRO) {
-            driver_state.gyro = value;
-            driver_state.have_gyro = true;
-            driver_state.last_gyro_ms = now_ms;
-        } else if (rid == RID_EULER) {
-            WITH_SEMAPHORE(state.sem);
-            state.quat.from_euler(radians(value.x), radians(value.y), radians(value.z));
-            state.have_quaternion = true;
+        if (driver_state.next_publish_us == 0) {
+            driver_state.next_publish_us = now_us + EKF_OUTPUT_PERIOD_US;
+            return;
         }
-
-        if ((rid == RID_ACCEL || rid == RID_GYRO) &&
-            driver_state.have_accel &&
-            driver_state.have_gyro &&
-            now_ms != driver_state.last_sample_ms) {
-            ins.accel = driver_state.accel;
-            ins.gyro = driver_state.gyro;
-            ins.temperature = 0.0f;
-            driver_state.last_sample_ms = now_ms;
-            publish_sample = true;
+        if (now_us < driver_state.next_publish_us) {
+            return;
         }
+        if (now_us - driver_state.next_publish_us > 2U * EKF_OUTPUT_PERIOD_US) {
+            driver_state.next_publish_us = now_us;
+        }
+        target_us = driver_state.next_publish_us;
+        driver_state.next_publish_us += EKF_OUTPUT_PERIOD_US;
     }
 
-    if (!publish_sample) {
-        return;
+    sample_t sample;
+    if (pop_closest_sample(target_us, sample)) {
+        publish_sample(sample);
     }
+}
+
+void AP_ExternalAHRS_DMIMU::publish_sample(const sample_t &sample)
+{
+    AP_ExternalAHRS::ins_data_message_t ins {};
+    ins.accel = sample.accel;
+    ins.gyro = sample.gyro;
+    ins.temperature = 0.0f;
 
     {
         WITH_SEMAPHORE(state.sem);
