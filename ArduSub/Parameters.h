@@ -452,7 +452,7 @@ static const struct AP_Param::defaults_table_struct defaults_table[] = {
     { "SERVO14_FUNCTION",    182},   // k_lights2
     { "SERVO16_FUNCTION",    7},     // k_mount_tilt
     { "SERVO16_REVERSED",    1},
-#else
+#elif CONFIG_HAL_BOARD_SUBTYPE != HAL_BOARD_SUBTYPE_LINUX_SUBROV
 #if AP_BARO_PROBE_EXT_PARAMETER_ENABLED
     { "BARO_PROBE_EXT",      768},
 #endif

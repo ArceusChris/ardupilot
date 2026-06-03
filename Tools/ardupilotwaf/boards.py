@@ -1382,7 +1382,7 @@ class LinuxBoard(Board):
     def __init__(self):
         super().__init__()
 
-        self.with_can = True
+        self.with_can = self.get_name() != 'subrov'
 
     def configure(self, cfg):
         if hasattr(self, 'hwdef'):
