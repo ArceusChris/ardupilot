@@ -45,3 +45,6 @@
 [submodule "modules/littlefs"]
 	path = modules/littlefs
 	url = https://github.com/ArduPilot/littlefs.git
+[submodule "DM-IMU"]
+	path = DM-IMU
+	url = git@github.com:dmBots/DM-IMU.git

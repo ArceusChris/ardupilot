@@ -236,7 +236,7 @@ static RCOutput_Sysfs rcoutDriver(0, 0, 7);
 #elif CONFIG_HAL_BOARD_SUBTYPE == HAL_BOARD_SUBTYPE_LINUX_RPI
 static RCOutput_RPI rcoutDriver;
 #elif CONFIG_HAL_BOARD_SUBTYPE == HAL_BOARD_SUBTYPE_LINUX_SUBROV
-static RCOutput_PCA9685 rcoutDriver(i2c_mgr_instance.get_device_ptr(5, PCA9685_PRIMARY_ADDRESS), 0, 0, -1);
+static RCOutput_PCA9685 rcoutDriver(i2c_mgr_instance.get_device_ptr(0, PCA9685_PRIMARY_ADDRESS), 0, 0, -1);
 #else
 static Empty::RCOutput rcoutDriver;
 #endif
